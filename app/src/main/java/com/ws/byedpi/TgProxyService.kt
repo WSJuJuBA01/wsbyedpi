@@ -78,7 +78,8 @@ class TgProxyService : Service() {
             port,
             bytes,
             TgConfig.cf(this),
-            TgConfig.parseDomains(TgConfig.cfDomains(this))
+            TgConfig.parseDomains(TgConfig.cfDomains(this)),
+            TgConfig.poolSize(this)
         ) { log(it) }
         try {
             e.start()
