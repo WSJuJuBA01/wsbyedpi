@@ -19,6 +19,7 @@ import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.widget.doAfterTextChanged
+import com.google.android.material.button.MaterialButtonToggleGroup
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import com.google.android.material.switchmaterial.SwitchMaterial
 
@@ -36,6 +37,7 @@ class TelegramActivity : AppCompatActivity() {
     private lateinit var tvSecret: TextView
     private lateinit var etHost: EditText
     private lateinit var etPort: EditText
+    private lateinit var tgPool: MaterialButtonToggleGroup
     private lateinit var swCf: SwitchMaterial
     private lateinit var etCf: EditText
     private lateinit var swAuto: SwitchMaterial
@@ -60,6 +62,7 @@ class TelegramActivity : AppCompatActivity() {
         tvSecret = findViewById(R.id.tvSecret)
         etHost = findViewById(R.id.etHost)
         etPort = findViewById(R.id.etPort)
+        tgPool = findViewById(R.id.tgPool)
         swCf = findViewById(R.id.swCf)
         etCf = findViewById(R.id.etCf)
         swAuto = findViewById(R.id.swAuto)
@@ -73,6 +76,13 @@ class TelegramActivity : AppCompatActivity() {
         swCf.isChecked = TgConfig.cf(this)
         etCf.setText(TgConfig.cfDomains(this))
         swAuto.isChecked = TgConfig.autostart(this)
+        tgPool.check(
+            when (TgConfig.poolSize(this)) {
+                2 -> R.id.btnPool2
+                6 -> R.id.btnPool6
+                else -> R.id.btnPool4
+            }
+        )
         updateLink()
         updateCfVisibility()
 
@@ -88,6 +98,16 @@ class TelegramActivity : AppCompatActivity() {
                 val p = it?.toString()?.toIntOrNull()
                 if (p != null && p in 1024..65535) TgConfig.setPort(this, p)
                 updateLink()
+            }
+        }
+        tgPool.addOnButtonCheckedListener { _, id, checked ->
+            if (checked && !loading) {
+                val size = when (id) {
+                    R.id.btnPool2 -> 2
+                    R.id.btnPool6 -> 6
+                    else -> 4
+                }
+                TgConfig.setPoolSize(this, size)
             }
         }
         swCf.setOnCheckedChangeListener { _, on ->
