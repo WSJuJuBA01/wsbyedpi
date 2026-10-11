@@ -17,10 +17,13 @@ import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
@@ -30,17 +33,32 @@ private const val TAG_ABRIDGED = 0xefefefefL
 private const val TAG_INTERMEDIATE = 0xeeeeeeeeL
 private const val TAG_PADDED = 0xddddddddL
 private const val MAX_PACKET = 16 * 1024 * 1024
-private const val WEB_IP = "149.154.167.220"
+private const val POOL_MAX_AGE = 55_000L
 
-private val WEB_HOST = Regex("kws[24](-1)?\\.web\\.telegram\\.org")
+// Прямой WebSocket есть только для DC 2 и 4 (как в оригинале Flowseal)
+private const val WS_IP = "149.154.167.220"
+private val WS_DCS = setOf(2, 4)
+private val WEB_HOST = Regex("kws[1-5](-1)?\\.web\\.telegram\\.org")
 
+// Адреса DC для запасного прямого TCP
 private val DC_IPS = mapOf(
-    1 to "149.154.175.53",
+    1 to "149.154.175.50",
     2 to "149.154.167.51",
     3 to "149.154.175.100",
     4 to "149.154.167.91",
-    5 to "91.108.56.130"
+    5 to "149.154.171.5",
+    203 to "91.105.192.100"
 )
+
+private const val DOMAINS_URL =
+    "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/refs/heads/main/.github/cfproxy-domains.txt"
+
+// Встроенный запасной список (в том же обфусцированном виде, что и в оригинале)
+private val FALLBACK_ENCODED = listOf(
+    "virkgj.com", "vmmzovy.com", "mkuosckvso.com", "zaewayzmplad.com", "twdmbzcm.com"
+)
+
+private val DOMAIN_RE = Regex("^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$")
 
 private val FORBIDDEN_FIRST = setOf(
     0x44414548L, 0x54534f50L, 0x20544547L, 0x4954504fL,
@@ -90,34 +108,68 @@ private fun closeQuiet(s: Socket) {
     }
 }
 
+/** Деобфускация записи списка доменов (шифр Цезаря, как в оригинале). */
+private fun deobfuscate(s: String): String? {
+    val line = s.trim()
+    if (!line.endsWith(".com")) return null
+    val prefix = line.removeSuffix(".com")
+    val n = prefix.count { it in 'a'..'z' || it in 'A'..'Z' }
+    val sb = StringBuilder()
+    for (c in prefix) {
+        when (c) {
+            in 'a'..'z' -> sb.append('a' + Math.floorMod(c - 'a' - n, 26))
+            in 'A'..'Z' -> sb.append('A' + Math.floorMod(c - 'A' - n, 26))
+            else -> sb.append(c)
+        }
+    }
+    return sb.toString() + ".co.uk"
+}
+
 /**
- * Локальный MTProto-прокси для Telegram: принимает подключение клиента (с секретом),
- * определяет DC и пересылает трафик на сервер Telegram через WebSocket
- * (прямой, через Cloudflare-домены) или обычным TCP.
+ * Локальный MTProto-прокси для Telegram.
+ * Маршруты: прямой WebSocket (DC 2 и 4, с пулом) -> Cloudflare-домены -> прямой TCP.
  */
 class TgProxyEngine(
     private val host: String,
     private val port: Int,
     private val secret: ByteArray,
     private val cfEnabled: Boolean,
-    private val cfDomains: List<String>,
+    private val extraDomains: List<String>,
+    private val poolSize: Int,
     private val log: (String) -> Unit
 ) {
     private val random = SecureRandom()
     private val executor = Executors.newCachedThreadPool()
+    private val scheduler = Executors.newSingleThreadScheduledExecutor()
     private val clients: MutableSet<Socket> = ConcurrentHashMap.newKeySet()
 
     @Volatile
     private var serverSocket: ServerSocket? = null
 
+    @Volatile
+    private var running = false
+
+    @Volatile
+    private var defaultDomains: List<String> =
+        FALLBACK_ENCODED.mapNotNull { deobfuscate(it) }
+
+    private val cfRotate = AtomicInteger(0)
+    private val stickyCf = ConcurrentHashMap<Int, String>()
+    private val wsCooldown = ConcurrentHashMap<Int, Long>()
+    private val cfCooldown = ConcurrentHashMap<Int, Long>()
+    private val pools = ConcurrentHashMap<Int, ConcurrentLinkedQueue<WsConn>>()
+    private val refilling = ConcurrentHashMap<Int, AtomicBoolean>()
+
+    // Без пингов: сервер Telegram мог не отвечать на них, и соединения рвались
     private val http: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(6, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
-        .pingInterval(25, TimeUnit.SECONDS)
+        .followRedirects(false)
+        .followSslRedirects(false)
         .dns(object : Dns {
             override fun lookup(hostname: String): List<InetAddress> {
                 if (WEB_HOST.matches(hostname)) {
-                    return listOf(InetAddress.getByName(WEB_IP))
+                    return listOf(InetAddress.getByName(WS_IP))
                 }
                 return Dns.SYSTEM.lookup(hostname)
             }
@@ -131,30 +183,75 @@ class TgProxyEngine(
         ss.reuseAddress = true
         ss.bind(InetSocketAddress(InetAddress.getByName(host), port))
         serverSocket = ss
-        executor.execute {
-            while (!ss.isClosed) {
-                try {
-                    val s = ss.accept()
-                    s.tcpNoDelay = true
-                    clients.add(s)
-                    executor.execute { handle(s) }
-                } catch (e: Exception) {
-                    if (!ss.isClosed) log("accept: ${e.message}")
-                }
-            }
+        running = true
+        executor.execute { acceptLoop(ss) }
+        if (cfEnabled) executor.execute { fetchDefaultDomains() }
+        if (poolSize > 0) {
+            warmPools()
+            scheduler.scheduleWithFixedDelay({ if (running) warmPools() }, 20, 20, TimeUnit.SECONDS)
         }
     }
 
     fun stop() {
+        running = false
         try {
             serverSocket?.close()
         } catch (_: Exception) {
         }
         clients.forEach { closeQuiet(it) }
         clients.clear()
+        pools.values.forEach { q ->
+            while (true) {
+                val c = q.poll() ?: break
+                c.close()
+            }
+        }
+        scheduler.shutdownNow()
         executor.shutdownNow()
         http.dispatcher.executorService.shutdown()
         http.connectionPool.evictAll()
+    }
+
+    private fun acceptLoop(ss: ServerSocket) {
+        while (!ss.isClosed) {
+            try {
+                val s = ss.accept()
+                s.tcpNoDelay = true
+                clients.add(s)
+                executor.execute { handle(s) }
+            } catch (e: Exception) {
+                if (!ss.isClosed) log("accept: ${e.message}")
+            }
+        }
+    }
+
+    // ---------- Список Cloudflare-доменов ----------
+
+    private fun cfDomainList(): List<String> = (extraDomains + defaultDomains).distinct()
+
+    private fun fetchDefaultDomains() {
+        try {
+            val client = http.newBuilder().callTimeout(10, TimeUnit.SECONDS).build()
+            client.newCall(Request.Builder().url(DOMAINS_URL).build()).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    log("Список CF-доменов: HTTP ${resp.code}, беру встроенный")
+                    return
+                }
+                val text = resp.body?.string().orEmpty()
+                val list = text.lines()
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() && !it.startsWith("#") }
+                    .mapNotNull { deobfuscate(it) }
+                    .filter { DOMAIN_RE.matches(it) }
+                    .distinct()
+                if (list.isNotEmpty()) {
+                    defaultDomains = list
+                    log("CF-домены загружены: ${list.size}")
+                }
+            }
+        } catch (e: Exception) {
+            log("Список CF-доменов не загружен (${e.javaClass.simpleName}), беру встроенный")
+        }
     }
 
     // ---------- Шифрование ----------
@@ -191,7 +288,7 @@ class TgProxyEngine(
         return ClientSession(tag, s16(plain, 60), dec, enc)
     }
 
-    private fun buildServerInit(tag: Long, dc: Int): ServerSession {
+    private fun buildServerInit(tag: Long, dcField: Int): ServerSession {
         val b = ByteArray(64)
         while (true) {
             random.nextBytes(b)
@@ -201,8 +298,8 @@ class TgProxyEngine(
             break
         }
         putLe32(b, 56, tag)
-        b[60] = (dc and 0xff).toByte()
-        b[61] = ((dc shr 8) and 0xff).toByte()
+        b[60] = (dcField and 0xff).toByte()
+        b[61] = ((dcField shr 8) and 0xff).toByte()
         val rev = b.reversedArray()
         val encToDc = Crypt(b.copyOfRange(8, 40), b.copyOfRange(40, 56))
         val decFromDc = Crypt(rev.copyOfRange(8, 40), rev.copyOfRange(40, 56))
@@ -250,17 +347,45 @@ class TgProxyEngine(
         }
     }
 
-    // ---------- Маршруты до Telegram ----------
+    // ---------- Соединения с Telegram ----------
 
     private interface Upstream {
         fun send(data: ByteArray): Boolean
         fun close()
     }
 
-    private class WsUpstream(private val ws: WebSocket) : Upstream {
-        override fun send(data: ByteArray): Boolean = ws.send(data.toByteString())
+    /** WebSocket, который можно держать в пуле и привязать к клиенту позже. */
+    private class WsConn : Upstream {
+        val created: Long = System.currentTimeMillis()
+
+        @Volatile
+        var ws: WebSocket? = null
+
+        @Volatile
+        var onData: ((ByteArray) -> Unit)? = null
+
+        @Volatile
+        var onDone: (() -> Unit)? = null
+
+        @Volatile
+        var closed = false
+
+        override fun send(data: ByteArray): Boolean =
+            !closed && ws?.send(data.toByteString()) == true
+
         override fun close() {
-            ws.close(1000, null)
+            closed = true
+            try {
+                ws?.close(1000, null)
+            } catch (_: Exception) {
+            }
+        }
+
+        fun attach(init: ByteArray, data: (ByteArray) -> Unit, done: () -> Unit): Boolean {
+            onData = data
+            onDone = done
+            if (closed) return false
+            return ws?.send(init.toByteString()) == true
         }
     }
 
@@ -282,47 +407,14 @@ class TgProxyEngine(
         }
     }
 
-    private fun openUpstream(
-        dc: Int,
-        media: Boolean,
-        init: ByteArray,
-        onData: (ByteArray) -> Unit,
-        onDone: () -> Unit
-    ): Upstream? {
-        val label = "kws$dc" + if (media) "-1" else ""
-        val tagDc = "DC$dc" + if (media) "m" else ""
+    private class WsOutcome(val conn: WsConn?, val code: Int, val error: String?)
 
-        connectWs("wss://$label.web.telegram.org/apiws", init, onData, onDone)?.let {
-            log("$tagDc: WebSocket напрямую")
-            return it
-        }
-        if (cfEnabled) {
-            if (cfDomains.isEmpty()) {
-                log("CF включён, но домены не заданы")
-            }
-            for (d in cfDomains) {
-                connectWs("wss://$label.$d/apiws", init, onData, onDone)?.let {
-                    log("$tagDc: WebSocket через CF ($d)")
-                    return it
-                }
-            }
-        }
-        connectTcp(dc, init, onData, onDone)?.let {
-            log("$tagDc: прямой TCP")
-            return it
-        }
-        return null
-    }
-
-    private fun connectWs(
-        url: String,
-        init: ByteArray,
-        onData: (ByteArray) -> Unit,
-        onDone: () -> Unit
-    ): Upstream? {
+    private fun openWs(url: String, waitSec: Long): WsOutcome {
+        val conn = WsConn()
         val opened = CountDownLatch(1)
         val ok = AtomicBoolean(false)
-        val active = AtomicBoolean(false)
+        val code = AtomicInteger(0)
+        val err = AtomicReference<String?>(null)
         val req = Request.Builder()
             .url(url)
             .header("Sec-WebSocket-Protocol", "binary")
@@ -340,50 +432,216 @@ class TgProxyEngine(
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
-                if (active.get()) onData(bytes.toByteArray())
+                conn.onData?.invoke(bytes.toByteArray())
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 webSocket.close(1000, null)
-                if (active.get()) onDone()
+                conn.closed = true
+                conn.onDone?.invoke()
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                if (active.get()) onDone()
+                conn.closed = true
+                conn.onDone?.invoke()
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (!ok.get()) log("WS ${req.url.host}: ${t.javaClass.simpleName}")
+                code.set(response?.code ?: 0)
+                err.set(t.javaClass.simpleName)
+                conn.closed = true
                 opened.countDown()
-                if (active.get()) onDone()
+                conn.onDone?.invoke()
             }
         })
-        opened.await(8, TimeUnit.SECONDS)
+        conn.ws = ws
+        opened.await(waitSec, TimeUnit.SECONDS)
         if (!ok.get()) {
+            conn.closed = true
             ws.cancel()
-            return null
+            return WsOutcome(null, code.get(), err.get() ?: "таймаут")
         }
-        active.set(true)
-        if (!ws.send(init.toByteString())) {
-            ws.cancel()
-            return null
-        }
-        return WsUpstream(ws)
+        return WsOutcome(conn, 101, null)
     }
 
-    private fun connectTcp(
-        dc: Int,
-        init: ByteArray,
+    private fun wsHosts(dc: Int, media: Boolean): List<String> {
+        val base = "kws$dc.web.telegram.org"
+        val one = "kws$dc-1.web.telegram.org"
+        return if (media) listOf(one, base) else listOf(base, one)
+    }
+
+    private fun poolKey(dc: Int, media: Boolean): Int = dc * 2 + if (media) 1 else 0
+
+    /** Прямой WebSocket: пробуем оба имени, при сбое ставим паузу для этого DC. */
+    private fun connectDirectWs(dc: Int, media: Boolean): WsConn? {
+        var redirects = 0
+        var tried = 0
+        for (h in wsHosts(dc, media)) {
+            tried++
+            val r = openWs("wss://$h/apiws", 9)
+            if (r.conn != null) {
+                wsCooldown.remove(dc)
+                return r.conn
+            }
+            if (r.code in 300..399) redirects++
+            log("WS $h: ${if (r.code != 0) "HTTP ${r.code}" else r.error}")
+        }
+        val pause = if (redirects == tried) 300_000L else 30_000L
+        wsCooldown[dc] = System.currentTimeMillis() + pause
+        return null
+    }
+
+    /** WebSocket через Cloudflare-домены (kwsN.домен), запоминаем рабочий для DC. */
+    private fun connectCf(dc: Int, media: Boolean): WsConn? {
+        val domains = cfDomainList()
+        if (domains.isEmpty()) return null
+        val key = poolKey(dc, media)
+        val order = ArrayList<String>()
+        stickyCf[key]?.let { order.add(it) }
+        val start = cfRotate.getAndIncrement()
+        for (i in 0 until minOf(2, domains.size)) {
+            val d = domains[(start + i) % domains.size]
+            val records = if (media) {
+                listOf("kws$dc-1.$d", "kws$dc.$d")
+            } else {
+                listOf("kws$dc.$d", "kws$dc-1.$d")
+            }
+            for (r in records) if (r !in order) order.add(r)
+        }
+        for (rec in order) {
+            val r = openWs("wss://$rec/apiws", 6)
+            if (r.conn != null) {
+                stickyCf[key] = rec
+                cfCooldown.remove(dc)
+                return r.conn
+            }
+            log("CF $rec: ${if (r.code != 0) "HTTP ${r.code}" else r.error}")
+        }
+        cfCooldown[dc] = System.currentTimeMillis() + 60_000L
+        return null
+    }
+
+    // ---------- Пул прямых WebSocket ----------
+
+    private fun warmPools() {
+        for (dc in WS_DCS) {
+            refillAsync(dc, false)
+            refillAsync(dc, true)
+        }
+    }
+
+    private fun takePooled(dc: Int, media: Boolean): WsConn? {
+        val q = pools[poolKey(dc, media)] ?: return null
+        while (true) {
+            val c = q.poll() ?: return null
+            if (!c.closed && System.currentTimeMillis() - c.created < POOL_MAX_AGE) return c
+            c.close()
+        }
+    }
+
+    private fun refillAsync(dc: Int, media: Boolean) {
+        if (poolSize <= 0 || !running) return
+        val flag = refilling.getOrPut(poolKey(dc, media)) { AtomicBoolean(false) }
+        if (!flag.compareAndSet(false, true)) return
+        try {
+            executor.execute {
+                try {
+                    refill(dc, media)
+                } finally {
+                    flag.set(false)
+                }
+            }
+        } catch (e: Exception) {
+            flag.set(false)
+        }
+    }
+
+    private fun refill(dc: Int, media: Boolean) {
+        val q = pools.getOrPut(poolKey(dc, media)) { ConcurrentLinkedQueue() }
+        val now = System.currentTimeMillis()
+        q.removeIf { c ->
+            val stale = c.closed || now - c.created > POOL_MAX_AGE
+            if (stale) c.close()
+            stale
+        }
+        while (running && q.size < poolSize) {
+            if ((wsCooldown[dc] ?: 0L) > System.currentTimeMillis()) break
+            val c = connectDirectWs(dc, media) ?: break
+            q.add(c)
+        }
+    }
+
+    // ---------- Выбор маршрута ----------
+
+    private fun openUpstream(
+        tag: Long,
+        dcRaw: Int,
+        ref: AtomicReference<ServerSession?>,
         onData: (ByteArray) -> Unit,
         onDone: () -> Unit
     ): Upstream? {
-        val ip = DC_IPS[dc] ?: return null
+        val media = dcRaw < 0
+        val dcAbs = abs(dcRaw)
+        val wsDc = if (dcAbs == 203) 2 else dcAbs
+        val label = "DC$wsDc" + if (media) "m" else ""
+        val cfOn = cfEnabled && cfDomainList().isNotEmpty()
+
+        fun attach(conn: WsConn, how: String): Upstream? {
+            val su = buildServerInit(tag, if (media) -wsDc else wsDc)
+            ref.set(su)
+            if (conn.attach(su.init, onData, onDone)) {
+                log("$label: $how")
+                return conn
+            }
+            conn.close()
+            return null
+        }
+
+        // 1. Прямой WebSocket (только DC 2 и 4): сначала пул, потом новое соединение
+        if (wsDc in WS_DCS) {
+            val cooling = (wsCooldown[wsDc] ?: 0L) > System.currentTimeMillis()
+            if (!cooling || !cfOn) {
+                var how = "WebSocket из пула"
+                var conn = takePooled(wsDc, media)
+                if (conn == null) {
+                    how = "WebSocket напрямую"
+                    conn = connectDirectWs(wsDc, media)
+                }
+                if (conn != null) {
+                    refillAsync(wsDc, media)
+                    attach(conn, how)?.let { return it }
+                }
+            }
+        }
+
+        // 2. Cloudflare
+        if (cfOn && (cfCooldown[wsDc] ?: 0L) <= System.currentTimeMillis()) {
+            connectCf(wsDc, media)?.let { c ->
+                attach(c, "WebSocket через Cloudflare")?.let { return it }
+            }
+        }
+
+        // 3. Прямой TCP (последний шанс)
+        return connectTcp(tag, dcRaw, ref, onData, onDone, label)
+    }
+
+    private fun connectTcp(
+        tag: Long,
+        dcRaw: Int,
+        ref: AtomicReference<ServerSession?>,
+        onData: (ByteArray) -> Unit,
+        onDone: () -> Unit,
+        label: String
+    ): Upstream? {
+        val ip = DC_IPS[abs(dcRaw)] ?: return null
         val s = Socket()
         try {
             s.connect(InetSocketAddress(ip, 443), 6000)
             s.tcpNoDelay = true
+            val su = buildServerInit(tag, dcRaw)
+            ref.set(su)
             val up = TcpUpstream(s)
-            if (!up.send(init)) {
+            if (!up.send(su.init)) {
                 up.close()
                 return null
             }
@@ -401,9 +659,11 @@ class TgProxyEngine(
                     onDone()
                 }
             }
+            log("$label: прямой TCP")
             return up
         } catch (e: Exception) {
             closeQuiet(s)
+            log("$label: TCP не удался (${e.javaClass.simpleName})")
             return null
         }
     }
@@ -425,36 +685,39 @@ class TgProxyEngine(
             }
             client.soTimeout = 0
 
-            val dc = abs(cs.dc)
-            val media = cs.dc < 0
-            if (dc !in 1..5) {
+            val dcAbs = abs(cs.dc)
+            if (dcAbs !in 1..5 && dcAbs != 203) {
                 log("Неизвестный DC: ${cs.dc}")
                 return
             }
 
-            val su = buildServerInit(cs.tag, cs.dc)
+            val ref = AtomicReference<ServerSession?>(null)
             val outLock = Any()
 
             val onData: (ByteArray) -> Unit = { data ->
-                synchronized(outLock) {
-                    val plain = su.decFromDc.crypt(data)
-                    val enc = cs.encToClient.crypt(plain)
-                    try {
-                        output.write(enc)
-                        output.flush()
-                    } catch (e: IOException) {
-                        closeQuiet(client)
+                val su = ref.get()
+                if (su != null) {
+                    synchronized(outLock) {
+                        val plain = su.decFromDc.crypt(data)
+                        val enc = cs.encToClient.crypt(plain)
+                        try {
+                            output.write(enc)
+                            output.flush()
+                        } catch (e: IOException) {
+                            closeQuiet(client)
+                        }
                     }
                 }
             }
             val onDone: () -> Unit = { closeQuiet(client) }
 
-            val up = openUpstream(dc, media, su.init, onData, onDone)
+            val up = openUpstream(cs.tag, cs.dc, ref, onData, onDone)
             if (up == null) {
-                log("DC$dc: нет доступного маршрута")
+                log("DC$dcAbs: нет доступного маршрута")
                 return
             }
             upstream = up
+            val su = ref.get() ?: return
 
             val splitter = PacketSplitter(cs.tag)
             val buf = ByteArray(16384)
