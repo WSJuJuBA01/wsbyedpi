@@ -78,6 +78,9 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnSettings).setOnClickListener { openSettings() }
         tvAppsInfo.setOnClickListener { openSettings() }
         findViewById<Button>(R.id.btnLog).setOnClickListener { UiUtil.showLog(this) }
+        findViewById<Button>(R.id.btnTelegram).setOnClickListener {
+            startActivity(Intent(this, TelegramActivity::class.java))
+                }
         findViewById<Button>(R.id.btnTest).setOnClickListener {
             startActivity(Intent(this, TestActivity::class.java))
                 }
