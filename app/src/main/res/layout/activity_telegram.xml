@@ -230,7 +230,7 @@
                     android:id="@+id/etCf"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:hint="Cloudflare-домены через запятую"
+                    android:hint="Свои CF-домены (необязательно, через запятую)"
                     android:importantForAutofill="no"
                     android:inputType="textUri|textNoSuggestions|textMultiLine"
                     android:maxLines="3"
