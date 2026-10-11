@@ -6,7 +6,7 @@ import androidx.core.content.ContextCompat
 
 object Config {
     const val PREFS = "ws_byedpi_prefs"
-    const val DEFAULT_SNI = "wb.ru"
+    const val DEFAULT_SNI = "ads.x5.ru"
 
     private const val AUTO = "--auto=torst,ssl_err"
 
@@ -60,7 +60,7 @@ object Config {
         Strategy("Обход #8", "Как #1, но TTL 10") { sni -> fake(10, sni) },
         Strategy("Обход #9", "Как #1, подмена SNI на max.ru") { _ -> fake(6, "max.ru") },
         Strategy("Обход #10", "Как #1, подмена SNI на ya.ru") { _ -> fake(6, "ya.ru") },
-        Strategy("Обход #11", "Как #1, подмена SNI на vk.com") { _ -> fake(6, "vk.com") },
+        Strategy("Обход #11", "Как #1, подмена SNI на vk.ru") { _ -> fake(6, "vk.ru") },
         Strategy("Обход #12", "Как #1, подмена SNI на gosuslugi.ru") { _ -> fake(6, "gosuslugi.ru") },
         Strategy("Обход #13", "Классика: split + disorder + tlsrec, без фейков") { _ ->
             "-s 1+s -d 3+s -r 1+s -M h,d"
