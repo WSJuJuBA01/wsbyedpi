@@ -66,6 +66,15 @@ object TgConfig {
             .map { it.trim().lowercase() }
             .filter { domainRegex.matches(it) }
 
+    fun poolSize(ctx: Context): Int {
+        val v = p(ctx).getInt("POOL", 4)
+        return if (v == 2 || v == 4 || v == 6) v else 4
+    }
+
+    fun setPoolSize(ctx: Context, v: Int) {
+        p(ctx).edit().putInt("POOL", v).apply()
+    }
+
     fun autostart(ctx: Context): Boolean = p(ctx).getBoolean("AUTOSTART", false)
 
     fun setAutostart(ctx: Context, v: Boolean) {
