@@ -6,7 +6,8 @@ import java.security.SecureRandom
 object TgConfig {
     private const val PREFS = "ws_tg_prefs"
     const val DEFAULT_HOST = "127.0.0.1"
-    const val DEFAULT_PORT = 8080
+    // 29473, а не 8080: порт 8080 любят занимать другие прокси (в т.ч. оригинальный WS TG Proxy)
+    const val DEFAULT_PORT = 29473
 
     private val hostRegex = Regex("^\\d{1,3}(\\.\\d{1,3}){3}$")
     private val secretRegex = Regex("^[0-9a-f]{32}$")
@@ -79,6 +80,20 @@ object TgConfig {
 
     fun setAutostart(ctx: Context, v: Boolean) {
         p(ctx).edit().putBoolean("AUTOSTART", v).apply()
+    }
+
+    /** Не давать процессору засыпать, пока прокси работает */
+    fun wakeLock(ctx: Context): Boolean = p(ctx).getBoolean("WAKE", true)
+
+    fun setWakeLock(ctx: Context, v: Boolean) {
+        p(ctx).edit().putBoolean("WAKE", v).apply()
+    }
+
+    /** Пользователь включил прокси и не выключал: нужен для возврата после убийства службы системой */
+    fun wantRunning(ctx: Context): Boolean = p(ctx).getBoolean("WANT", false)
+
+    fun setWantRunning(ctx: Context, v: Boolean) {
+        p(ctx).edit().putBoolean("WANT", v).apply()
     }
 
     fun link(ctx: Context): String =
