@@ -16,6 +16,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
+import java.util.concurrent.Callable
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
@@ -138,10 +139,20 @@ class TgProxyEngine(
     private val poolSize: Int,
     private val log: (String) -> Unit
 ) {
+    /** Вызывается, когда Telegram подключается с неверным секретом */
+    @Volatile
+    var onBadSecret: (() -> Unit)? = null
+
     private val random = SecureRandom()
     private val executor = Executors.newCachedThreadPool()
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
     private val clients: MutableSet<Socket> = ConcurrentHashMap.newKeySet()
+
+    private val active = AtomicInteger(0)
+    private val routeWs = AtomicInteger(0)
+    private val routeCf = AtomicInteger(0)
+    private val routeTcp = AtomicInteger(0)
+    private val badSecret = AtomicInteger(0)
 
     @Volatile
     private var serverSocket: ServerSocket? = null
@@ -155,15 +166,17 @@ class TgProxyEngine(
 
     private val cfRotate = AtomicInteger(0)
     private val stickyCf = ConcurrentHashMap<Int, String>()
+    private val cfBad = ConcurrentHashMap<String, Long>()
     private val wsCooldown = ConcurrentHashMap<Int, Long>()
     private val cfCooldown = ConcurrentHashMap<Int, Long>()
     private val pools = ConcurrentHashMap<Int, ConcurrentLinkedQueue<WsConn>>()
     private val refilling = ConcurrentHashMap<Int, AtomicBoolean>()
 
-    // Без пингов: сервер Telegram мог не отвечать на них, и соединения рвались
+    // Пинг раз в минуту держит соединения живыми, пока клиент молчит
     private val http: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(6, TimeUnit.SECONDS)
+        .connectTimeout(5, TimeUnit.SECONDS)
         .readTimeout(0, TimeUnit.MILLISECONDS)
+        .pingInterval(60, TimeUnit.SECONDS)
         .followRedirects(false)
         .followSslRedirects(false)
         .dns(object : Dns {
@@ -175,6 +188,12 @@ class TgProxyEngine(
             }
         })
         .build()
+
+    fun statsLine(): String {
+        val sb = StringBuilder("Активно: ${active.get()} · WS: ${routeWs.get()} · CF: ${routeCf.get()} · TCP: ${routeTcp.get()}")
+        if (badSecret.get() > 0) sb.append(" · неверный ключ: ${badSecret.get()}")
+        return sb.toString()
+    }
 
     // ---------- Запуск и остановка ----------
 
@@ -217,6 +236,7 @@ class TgProxyEngine(
             try {
                 val s = ss.accept()
                 s.tcpNoDelay = true
+                s.keepAlive = true
                 clients.add(s)
                 executor.execute { handle(s) }
             } catch (e: Exception) {
@@ -370,8 +390,20 @@ class TgProxyEngine(
         @Volatile
         var closed = false
 
-        override fun send(data: ByteArray): Boolean =
-            !closed && ws?.send(data.toByteString()) == true
+        override fun send(data: ByteArray): Boolean {
+            val w = ws ?: return false
+            // Если очередь на отправку разрослась (большая загрузка), даём ей разгрузиться
+            var waited = 0
+            while (!closed && w.queueSize() > 2_000_000L && waited < 3000) {
+                try {
+                    Thread.sleep(10)
+                } catch (e: InterruptedException) {
+                    return false
+                }
+                waited += 10
+            }
+            return !closed && w.send(data.toByteString())
+        }
 
         override fun close() {
             closed = true
@@ -478,7 +510,7 @@ class TgProxyEngine(
         var tried = 0
         for (h in wsHosts(dc, media)) {
             tried++
-            val r = openWs("wss://$h/apiws", 9)
+            val r = openWs("wss://$h/apiws", 6)
             if (r.conn != null) {
                 wsCooldown.remove(dc)
                 return r.conn
@@ -486,18 +518,19 @@ class TgProxyEngine(
             if (r.code in 300..399) redirects++
             log("WS $h: ${if (r.code != 0) "HTTP ${r.code}" else r.error}")
         }
-        val pause = if (redirects == tried) 300_000L else 30_000L
+        val pause = if (redirects == tried) 300_000L else 20_000L
         wsCooldown[dc] = System.currentTimeMillis() + pause
         return null
     }
 
-    /** WebSocket через Cloudflare-домены (kwsN.домен), запоминаем рабочий для DC. */
+    /** WebSocket через Cloudflare-домены (kwsN.домен). Плохие записи ставим на паузу (429: на минуту). */
     private fun connectCf(dc: Int, media: Boolean): WsConn? {
         val domains = cfDomainList()
         if (domains.isEmpty()) return null
         val key = poolKey(dc, media)
+        val now = System.currentTimeMillis()
         val order = ArrayList<String>()
-        stickyCf[key]?.let { order.add(it) }
+        stickyCf[key]?.let { if ((cfBad[it] ?: 0L) <= now) order.add(it) }
         val start = cfRotate.getAndIncrement()
         for (i in 0 until minOf(2, domains.size)) {
             val d = domains[(start + i) % domains.size]
@@ -506,18 +539,26 @@ class TgProxyEngine(
             } else {
                 listOf("kws$dc.$d", "kws$dc-1.$d")
             }
-            for (r in records) if (r !in order) order.add(r)
+            for (r in records) {
+                if (r !in order && (cfBad[r] ?: 0L) <= now) order.add(r)
+            }
+        }
+        if (order.isEmpty()) {
+            log("CF: все записи на паузе")
+            return null
         }
         for (rec in order) {
-            val r = openWs("wss://$rec/apiws", 6)
+            val r = openWs("wss://$rec/apiws", 5)
             if (r.conn != null) {
                 stickyCf[key] = rec
+                cfBad.remove(rec)
                 cfCooldown.remove(dc)
                 return r.conn
             }
+            cfBad[rec] = System.currentTimeMillis() + if (r.code == 429) 60_000L else 20_000L
             log("CF $rec: ${if (r.code != 0) "HTTP ${r.code}" else r.error}")
         }
-        cfCooldown[dc] = System.currentTimeMillis() + 60_000L
+        cfCooldown[dc] = System.currentTimeMillis() + 15_000L
         return null
     }
 
@@ -586,10 +627,11 @@ class TgProxyEngine(
         val label = "DC$wsDc" + if (media) "m" else ""
         val cfOn = cfEnabled && cfDomainList().isNotEmpty()
 
-        fun attach(conn: WsConn, how: String): Upstream? {
+        fun attach(conn: WsConn, how: String, viaCf: Boolean): Upstream? {
             val su = buildServerInit(tag, if (media) -wsDc else wsDc)
             ref.set(su)
             if (conn.attach(su.init, onData, onDone)) {
+                if (viaCf) routeCf.incrementAndGet() else routeWs.incrementAndGet()
                 log("$label: $how")
                 return conn
             }
@@ -609,7 +651,7 @@ class TgProxyEngine(
                 }
                 if (conn != null) {
                     refillAsync(wsDc, media)
-                    attach(conn, how)?.let { return it }
+                    attach(conn, how, false)?.let { return it }
                 }
             }
         }
@@ -617,7 +659,7 @@ class TgProxyEngine(
         // 2. Cloudflare
         if (cfOn && (cfCooldown[wsDc] ?: 0L) <= System.currentTimeMillis()) {
             connectCf(wsDc, media)?.let { c ->
-                attach(c, "WebSocket через Cloudflare")?.let { return it }
+                attach(c, "WebSocket через Cloudflare", true)?.let { return it }
             }
         }
 
@@ -636,8 +678,9 @@ class TgProxyEngine(
         val ip = DC_IPS[abs(dcRaw)] ?: return null
         val s = Socket()
         try {
-            s.connect(InetSocketAddress(ip, 443), 6000)
+            s.connect(InetSocketAddress(ip, 443), 5000)
             s.tcpNoDelay = true
+            s.keepAlive = true
             val su = buildServerInit(tag, dcRaw)
             ref.set(su)
             val up = TcpUpstream(s)
@@ -648,7 +691,7 @@ class TgProxyEngine(
             executor.execute {
                 try {
                     val inp = s.getInputStream()
-                    val b = ByteArray(16384)
+                    val b = ByteArray(32768)
                     while (true) {
                         val n = inp.read(b)
                         if (n < 0) break
@@ -659,6 +702,7 @@ class TgProxyEngine(
                     onDone()
                 }
             }
+            routeTcp.incrementAndGet()
             log("$label: прямой TCP")
             return up
         } catch (e: Exception) {
@@ -668,22 +712,77 @@ class TgProxyEngine(
         }
     }
 
+    // ---------- Проверка маршрутов ----------
+
+    private fun timeIt(block: () -> WsConn?): String {
+        val t0 = System.currentTimeMillis()
+        val c = block()
+        val ms = System.currentTimeMillis() - t0
+        return if (c != null) {
+            c.close()
+            "✓ $ms мс"
+        } else {
+            "✗ нет ответа"
+        }
+    }
+
+    /** Параллельно проверяет прямой WS (DC 2, 4) и Cloudflare (DC 1-5). Не требует запущенного прокси. */
+    fun selfCheck(): String {
+        if (cfEnabled) fetchDefaultDomains()
+        val jobs = ArrayList<Pair<String, Callable<String>>>()
+        for (dc in listOf(2, 4)) {
+            jobs.add("DC$dc прямой WS" to Callable { timeIt { connectDirectWs(dc, false) } })
+        }
+        if (cfEnabled) {
+            for (dc in listOf(1, 2, 3, 4, 5)) {
+                jobs.add("DC$dc через Cloudflare" to Callable { timeIt { connectCf(dc, false) } })
+            }
+        }
+        val futures = executor.invokeAll(jobs.map { it.second }, 28, TimeUnit.SECONDS)
+        val sb = StringBuilder()
+        sb.append(
+            if (cfEnabled) "Cloudflare-доменов: ${cfDomainList().size}\n\n"
+            else "Cloudflare выключен\n\n"
+        )
+        jobs.forEachIndexed { i, job ->
+            val f = futures[i]
+            val res = try {
+                if (f.isCancelled) "⏱ таймаут" else f.get()
+            } catch (e: Exception) {
+                "✗ ошибка"
+            }
+            sb.append("${job.first}: $res\n")
+        }
+        sb.append(
+            "\nЕсли везде ✗: нет интернета или сеть режет эти адреса. " +
+                "Если ✓ только у части: часть DC пойдёт по запасным маршрутам."
+        )
+        return sb.toString().trim()
+    }
+
     // ---------- Обработка одного клиента ----------
 
     private fun handle(client: Socket) {
         var upstream: Upstream? = null
+        var counted = false
         try {
-            client.soTimeout = 15000
+            client.soTimeout = 10000
             val input = client.getInputStream()
             val output = client.getOutputStream()
 
             val first = readFully(input, 64) ?: return
             val cs = parseClientInit(first)
             if (cs == null) {
-                log("Клиент: неверный секрет или протокол")
+                val n = badSecret.incrementAndGet()
+                if (n == 1 || n % 10 == 0) {
+                    log("Клиент: неверный ключ или не MTProto (раз: $n). Нажми «Применить в Telegram»")
+                }
+                onBadSecret?.invoke()
                 return
             }
             client.soTimeout = 0
+            active.incrementAndGet()
+            counted = true
 
             val dcAbs = abs(cs.dc)
             if (dcAbs !in 1..5 && dcAbs != 203) {
@@ -720,7 +819,7 @@ class TgProxyEngine(
             val su = ref.get() ?: return
 
             val splitter = PacketSplitter(cs.tag)
-            val buf = ByteArray(16384)
+            val buf = ByteArray(32768)
             while (true) {
                 val n = input.read(buf)
                 if (n < 0) break
@@ -732,6 +831,7 @@ class TgProxyEngine(
         } catch (e: Exception) {
             // обрыв соединения — обычная ситуация
         } finally {
+            if (counted) active.decrementAndGet()
             try {
                 upstream?.close()
             } catch (_: Exception) {
