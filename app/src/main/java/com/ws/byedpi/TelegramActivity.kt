@@ -11,11 +11,14 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.widget.doAfterTextChanged
@@ -33,7 +36,10 @@ class TelegramActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var fab: FloatingActionButton
     private lateinit var tvState: TextView
+    private lateinit var tvStats: TextView
+    private lateinit var tvWarn: TextView
     private lateinit var tvLink: TextView
+    private lateinit var tvManual: TextView
     private lateinit var tvSecret: TextView
     private lateinit var etHost: EditText
     private lateinit var etPort: EditText
@@ -41,6 +47,10 @@ class TelegramActivity : AppCompatActivity() {
     private lateinit var swCf: SwitchMaterial
     private lateinit var etCf: EditText
     private lateinit var swAuto: SwitchMaterial
+    private lateinit var swWake: SwitchMaterial
+    private lateinit var tvBattery: TextView
+    private lateinit var btnBattery: Button
+    private lateinit var btnCheck: Button
     private lateinit var tvLog: TextView
     private var loading = true
 
@@ -58,7 +68,10 @@ class TelegramActivity : AppCompatActivity() {
 
         fab = findViewById(R.id.fab)
         tvState = findViewById(R.id.tvState)
+        tvStats = findViewById(R.id.tvStats)
+        tvWarn = findViewById(R.id.tvWarn)
         tvLink = findViewById(R.id.tvLink)
+        tvManual = findViewById(R.id.tvManual)
         tvSecret = findViewById(R.id.tvSecret)
         etHost = findViewById(R.id.etHost)
         etPort = findViewById(R.id.etPort)
@@ -66,6 +79,10 @@ class TelegramActivity : AppCompatActivity() {
         swCf = findViewById(R.id.swCf)
         etCf = findViewById(R.id.etCf)
         swAuto = findViewById(R.id.swAuto)
+        swWake = findViewById(R.id.swWake)
+        tvBattery = findViewById(R.id.tvBattery)
+        btnBattery = findViewById(R.id.btnBattery)
+        btnCheck = findViewById(R.id.btnCheck)
         tvLog = findViewById(R.id.tvLog)
 
         findViewById<Button>(R.id.btnBack).setOnClickListener { finish() }
@@ -76,6 +93,7 @@ class TelegramActivity : AppCompatActivity() {
         swCf.isChecked = TgConfig.cf(this)
         etCf.setText(TgConfig.cfDomains(this))
         swAuto.isChecked = TgConfig.autostart(this)
+        swWake.isChecked = TgConfig.wakeLock(this)
         tgPool.check(
             when (TgConfig.poolSize(this)) {
                 2 -> R.id.btnPool2
@@ -122,6 +140,9 @@ class TelegramActivity : AppCompatActivity() {
         swAuto.setOnCheckedChangeListener { _, on ->
             if (!loading) TgConfig.setAutostart(this, on)
         }
+        swWake.setOnCheckedChangeListener { _, on ->
+            if (!loading) TgConfig.setWakeLock(this, on)
+        }
 
         findViewById<Button>(R.id.btnRegen).setOnClickListener {
             tvSecret.text = TgConfig.regenSecret(this)
@@ -146,7 +167,7 @@ class TelegramActivity : AppCompatActivity() {
                 TgProxyService.lastError?.let {
                     Toast.makeText(this, it, Toast.LENGTH_LONG).show()
                 }
-            }, 1500)
+            }, 1800)
         }
 
         findViewById<Button>(R.id.btnApply).setOnClickListener {
@@ -163,21 +184,75 @@ class TelegramActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnCopy).setOnClickListener {
             copy("ws-tg-link", TgConfig.link(this))
         }
+        findViewById<Button>(R.id.btnCopySecret).setOnClickListener {
+            copy("ws-tg-secret", "dd" + TgConfig.secret(this))
+        }
         findViewById<Button>(R.id.btnCopyLog).setOnClickListener {
             copy("ws-tg-log", TgProxyService.logText())
         }
+
+        btnBattery.setOnClickListener {
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            } catch (e: Exception) {
+                try {
+                    startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+                } catch (e2: Exception) {
+                    Toast.makeText(this, "Открой настройки батареи вручную", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+
+        btnCheck.setOnClickListener { runCheck() }
 
         loading = false
     }
 
     override fun onResume() {
         super.onResume()
+        updateBattery()
         handler.post(tick)
     }
 
     override fun onPause() {
         handler.removeCallbacks(tick)
         super.onPause()
+    }
+
+    private fun runCheck() {
+        btnCheck.isEnabled = false
+        Toast.makeText(this, "Проверяю маршруты, до 30 секунд…", Toast.LENGTH_SHORT).show()
+        val host = TgConfig.host(this)
+        val port = TgConfig.port(this)
+        val cf = TgConfig.cf(this)
+        val domains = TgConfig.parseDomains(TgConfig.cfDomains(this))
+        Thread {
+            val engine = TgProxyEngine(host, port, ByteArray(16), cf, domains, 0) { TgProxyService.log(it) }
+            val report = try {
+                engine.selfCheck()
+            } catch (t: Throwable) {
+                "Ошибка проверки: $t"
+            } finally {
+                engine.stop()
+            }
+            TgProxyService.log("ПРОВЕРКА >>>\n$report")
+            runOnUiThread {
+                btnCheck.isEnabled = true
+                if (!isFinishing) {
+                    AlertDialog.Builder(this)
+                        .setTitle("Проверка маршрутов")
+                        .setMessage(report)
+                        .setPositiveButton("OK", null)
+                        .setNeutralButton("Копировать") { _, _ -> copy("ws-tg-check", report) }
+                        .show()
+                }
+            }
+        }.start()
     }
 
     private fun copy(label: String, text: String) {
@@ -188,10 +263,23 @@ class TelegramActivity : AppCompatActivity() {
 
     private fun updateLink() {
         tvLink.text = TgConfig.link(this)
+        tvManual.text = "Вручную в Telegram: сервер ${TgConfig.host(this)}, " +
+            "порт ${TgConfig.port(this)}, секрет dd${TgConfig.secret(this)}"
     }
 
     private fun updateCfVisibility() {
         etCf.visibility = if (swCf.isChecked) View.VISIBLE else View.GONE
+    }
+
+    private fun updateBattery() {
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val ok = pm.isIgnoringBatteryOptimizations(packageName)
+        tvBattery.text = if (ok) {
+            "✓ Ограничение батареи отключено"
+        } else {
+            "⚠ Система может усыплять прокси, из-за этого бывают обрывы"
+        }
+        btnBattery.visibility = if (ok) View.GONE else View.VISIBLE
     }
 
     private fun refresh() {
@@ -204,5 +292,17 @@ class TelegramActivity : AppCompatActivity() {
             "Отключено"
         }
         tvState.setTextColor(if (on) Color.parseColor("#81C784") else Color.GRAY)
+
+        tvStats.visibility = if (on) View.VISIBLE else View.GONE
+        tvStats.text = TgProxyService.stats()
+
+        val bad = TgProxyService.badSecretHits
+        if (on && bad > 0) {
+            tvWarn.visibility = View.VISIBLE
+            tvWarn.text = "⚠ Telegram подключается с другим ключом или к другому прокси ($bad раз). " +
+                "Нажми «Применить в Telegram» ещё раз и удали старые прокси в настройках Telegram."
+        } else {
+            tvWarn.visibility = View.GONE
+        }
     }
 }
