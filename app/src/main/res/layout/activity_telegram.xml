@@ -34,48 +34,6 @@
                 android:textStyle="bold" />
         </LinearLayout>
 
-                <TextView
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="16dp"
-                    android:text="Пул WS"
-                    android:textColor="?attr/colorPrimary"
-                    android:textSize="14sp"
-                    android:textStyle="bold" />
-
-                <com.google.android.material.button.MaterialButtonToggleGroup
-                    android:id="@+id/tgPool"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:layout_marginTop="4dp"
-                    app:selectionRequired="true"
-                    app:singleSelection="true">
-
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btnPool2"
-                        style="?attr/materialButtonOutlinedStyle"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="2" />
-
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btnPool4"
-                        style="?attr/materialButtonOutlinedStyle"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="4" />
-
-                    <com.google.android.material.button.MaterialButton
-                        android:id="@+id/btnPool6"
-                        style="?attr/materialButtonOutlinedStyle"
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="6" />
-                </com.google.android.material.button.MaterialButtonToggleGroup>
-        
         <com.google.android.material.card.MaterialCardView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -107,15 +65,33 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="12dp"
-                    android:layout_marginBottom="12dp"
                     android:text="Отключено"
                     android:textSize="15sp"
                     android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tvStats"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    android:alpha="0.7"
+                    android:textSize="12sp"
+                    android:visibility="gone" />
+
+                <TextView
+                    android:id="@+id/tvWarn"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:textColor="#FFB74D"
+                    android:textSize="12sp"
+                    android:visibility="gone" />
 
                 <Button
                     android:id="@+id/btnApply"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
+                    android:layout_marginTop="12dp"
                     android:text="Применить в Telegram" />
 
                 <Button
@@ -134,6 +110,23 @@
                     android:ellipsize="end"
                     android:maxLines="2"
                     android:textSize="11sp" />
+
+                <TextView
+                    android:id="@+id/tvManual"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:alpha="0.7"
+                    android:textIsSelectable="true"
+                    android:textSize="11sp" />
+
+                <Button
+                    android:id="@+id/btnCopySecret"
+                    style="@style/Widget.MaterialComponents.Button.TextButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Копировать секрет"
+                    android:textSize="12sp" />
             </LinearLayout>
         </com.google.android.material.card.MaterialCardView>
 
@@ -219,6 +212,48 @@
                         android:textSize="22sp" />
                 </LinearLayout>
 
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="16dp"
+                    android:text="Пул WS"
+                    android:textColor="?attr/colorPrimary"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <com.google.android.material.button.MaterialButtonToggleGroup
+                    android:id="@+id/tgPool"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="4dp"
+                    app:selectionRequired="true"
+                    app:singleSelection="true">
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnPool2"
+                        style="?attr/materialButtonOutlinedStyle"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="2" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnPool4"
+                        style="?attr/materialButtonOutlinedStyle"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="4" />
+
+                    <com.google.android.material.button.MaterialButton
+                        android:id="@+id/btnPool6"
+                        style="?attr/materialButtonOutlinedStyle"
+                        android:layout_width="0dp"
+                        android:layout_height="wrap_content"
+                        android:layout_weight="1"
+                        android:text="6" />
+                </com.google.android.material.button.MaterialButtonToggleGroup>
+
                 <com.google.android.material.switchmaterial.SwitchMaterial
                     android:id="@+id/swCf"
                     android:layout_width="match_parent"
@@ -257,6 +292,57 @@
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
+            app:cardCornerRadius="20dp"
+            app:cardElevation="0dp">
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:padding="16dp">
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Работа в фоне"
+                    android:textColor="?attr/colorPrimary"
+                    android:textSize="14sp"
+                    android:textStyle="bold" />
+
+                <TextView
+                    android:id="@+id/tvBattery"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:textSize="13sp" />
+
+                <Button
+                    android:id="@+id/btnBattery"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="Разрешить работу в фоне" />
+
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/swWake"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="Не давать процессору засыпать" />
+
+                <TextView
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:alpha="0.7"
+                    android:text="На Xiaomi, Samsung, Huawei, Realme дополнительно: Настройки → Приложения → WSByeDPI → Автозапуск включить, Экономия заряда: Без ограничений. Закрепи приложение в списке недавних."
+                    android:textSize="12sp" />
+            </LinearLayout>
+        </com.google.android.material.card.MaterialCardView>
+
+        <com.google.android.material.card.MaterialCardView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="12dp"
             android:layout_marginBottom="12dp"
             app:cardCornerRadius="20dp"
             app:cardElevation="0dp">
@@ -270,16 +356,24 @@
                 <TextView
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:text="Лог"
+                    android:text="Диагностика"
                     android:textColor="?attr/colorPrimary"
                     android:textSize="14sp"
                     android:textStyle="bold" />
+
+                <Button
+                    android:id="@+id/btnCheck"
+                    style="@style/Widget.MaterialComponents.Button.OutlinedButton"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:text="🩺 Проверить маршруты" />
 
                 <TextView
                     android:id="@+id/tvLog"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
-                    android:layout_marginTop="6dp"
+                    android:layout_marginTop="8dp"
                     android:text="Лог пуст"
                     android:textIsSelectable="true"
                     android:textSize="11sp"
